@@ -13,6 +13,7 @@ this README is the single source of truth for building and running it.
 ## Features
 
 - 📲 **Telegram control** — feed from anywhere: `/feed`, `/stop`, `/status`, …
+- 🕒 **Daily meals** — `/schedule 06:00 13:00`, saved on the ESP32 (Ecuador UTC−5)
 - 🔒 **Access control** — feeding restricted to an allow-list of chat ids
 - 🛡️ **Guardrails** — emergency stop, feed cooldown, busy guard, and anti-flood
   resync (a queue of offline `/feed`s can't dump a pile of food on reconnect)
@@ -55,6 +56,7 @@ micropython/  MicroPython firmware (source of truth for the code)
   config.json.default settings template (copy to config.json)
   wifi.py            Wi-Fi station connect with retry/reconnect
   motor.py           Motor driver: feed / reverse / stop / run_feed_cycle
+  schedule.py        persistent daily meals + NTP clock (06:00 / 13:00 defaults)
   bot.py             Telegram bot: long-poll, commands, allow-list, guardrails
   led.py             timer-driven status-LED patterns
   test_motor_feed.py on-device test: motor feeds for 2 s in a row
@@ -122,14 +124,14 @@ because CH340 boards auto-reset when the serial port opens, which races
 PY=python3   # any python with pyserial installed
 
 # copy the firmware
-for f in config.json config.py wifi.py motor.py bot.py led.py main.py; do
+for f in config.json config.py wifi.py motor.py schedule.py bot.py led.py main.py; do
   $PY tools/espctl.py put "$f" "$f"
 done
 
 # install the requests library the bot needs (Wi-Fi must be set in config.json).
 # mpremote's `mip install` can't enter the raw REPL on this CH340 board, so do
 # it on-device:
-printf 'import wifi, config, mip\nwifi.connect(config)\nmip.install("requests")\n' > /tmp/inst.py
+printf 'import wifi, config, mip\nwifi.connect(config)\nmip.install("requests")\nmip.install("ntptime")\n' > /tmp/inst.py
 $PY tools/espctl.py run /tmp/inst.py
 
 # reboot so main.py runs the bot
@@ -167,12 +169,70 @@ $PY tools/espctl.py run test_motor_feed.py
 | Command | Action | Access |
 | ------- | ------ | ------ |
 | `/feed`   | Run one feed cycle (feed 2 s → reverse 0.5 s → feed 2 s → stop) | allow-list |
+| `/schedule` | Show daily times and clock sync status (UTC−5) | allow-list |
+| `/schedule 06:00 13:00` | Replace and enable daily meal times (1–12, HH:MM) | allow-list |
+| `/schedule off` / `/schedule on` | Disable / enable saved daily meals | allow-list |
 | `/stop`   | Emergency stop — stops the motor, aborts an in-progress feed | allow-list |
 | `/reboot` | Soft-restart the ESP32 | allow-list |
 | `/status` | Motor state, uptime, Wi-Fi IP, last feed, cooldown | open |
 | `/ping`   | Liveness check → `pong` | open |
 | `/id`     | Show your chat id | open |
 | `/help`   | Command list | open |
+
+## Automatic meals and updating an existing feeder
+
+The schedule runs **on the ESP32**: no running computer, Telegram user session,
+GitHub Actions, paid service, or recurring cost is needed. Updating the firmware
+once is required. First-use defaults are **06:00 and 13:00 every day**, Ecuador
+mainland time (fixed UTC−5; no daylight saving).
+
+For an already-configured board, connect USB and run from the repository root:
+
+```sh
+python3 -m pip install pyserial
+python3 micropython/tools/update_schedule.py --port /dev/ttyUSB0
+```
+
+Replace the port with the board's actual port (`/dev/ttyACM0` on some Linux
+boards, `/dev/cu.usbserial-...` on macOS, or `COM3` on Windows). The uploader
+stops the motor, checks/installs `ntptime` over the existing Wi-Fi connection,
+then uploads `schedule.py` and `bot.py` and reboots. It **preserves config.json**
+(Wi-Fi, token, pins, motor timings) and any existing `schedule.json` settings.
+It does not erase flash. Do not interrupt uploading; if it fails, reconnect and
+rerun it before using the feeder. Initial installation is still covered above.
+
+After reboot, send `/schedule` to verify `ON`, `06:00, 13:00`, and `Clock: synced`.
+To change meals later, send `/schedule 07:30 14:00 20:00`. Times must be 24-hour
+`HH:MM`; duplicates are collapsed. `/schedule off` pauses automatic meals and
+`/schedule on` resumes saved times. Manual `/feed` remains available.
+Settings and the last claimed meal are saved in `schedule.json`; do not delete
+this runtime file during routine updates. Rebooting does not reset the schedule.
+
+Clock synchronization uses NTP at boot (retry every minute), then every six
+hours. Until the first successful sync after boot, automatic feeding waits.
+After syncing, the RTC continues through a network outage while power remains
+on. `/schedule` reports whether the clock has ever synced in the current boot.
+The existing blocking Telegram poll/network calls can delay checks; a meal only
+runs when the loop observes its scheduled minute. There is **no catch-up** for
+missed meals after an outage or a long stall. This is not a hard real-time alarm.
+
+Automatic meals use the same feed cycle, cooldown, and `/stop` callback as
+manual feeding. The meal is persisted **before** attempting the motor, so a
+reset, failed/aborted cycle, or cooldown does not trigger an automatic retry of
+that meal. A corrupt schedule or failed state write prevents automatic feeding;
+set valid times explicitly with `/schedule HH:MM ...` to repair invalid settings.
+`/stop` stops the current cycle; use `/schedule off` to cancel future meals.
+Notifications go to the lowest allowed chat ID; in open mode they are logged on
+serial. The existing allow-list also controls schedule commands.
+
+Host tests (no hardware and no real Telegram messages):
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+The motor/USB upload still needs verification on the physical ESP32 after this
+change; host tests simulate the clock, Telegram transport, and motor.
 
 ## Status LED (GPIO5)
 
