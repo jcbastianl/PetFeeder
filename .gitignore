@@ -10,3 +10,7 @@ __pycache__/
 
 # Local secrets (WiFi / Telegram) -- keep config.json.default committed
 micropython/config.json
+
+# Device schedule and last claimed meal (runtime state)
+micropython/schedule.json
+micropython/schedule.json.tmp

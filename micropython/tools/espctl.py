@@ -72,6 +72,8 @@ def _exec(s, code, stream=False, timeout=60):
                         echoed = limit
         if buf.count(b"\x04") >= 2:
             break
+    if buf.count(b"\x04") < 2:
+        raise TimeoutError("board execution did not finish before timeout")
     if b"OK" not in buf:
         raise RuntimeError("no OK from board; got: %r" % bytes(buf[:160]))
     body = buf[buf.find(b"OK") + 2:]

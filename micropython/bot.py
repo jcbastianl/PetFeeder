@@ -3,13 +3,14 @@
 # Commands:
 #   /start, /help  greeting + command list + your chat id
 #   /feed          run one feed cycle (guarded by a cooldown + busy check)
+#   /schedule      show/set daily HH:MM times, or on/off (Ecuador UTC-5)
 #   /stop          emergency stop: stop the motor / abort an in-progress feed
 #   /status        motor state, uptime, WiFi, last feed, cooldown
 #   /ping          quick liveness check -> "pong"
 #   /id            reply with your chat id (use it to fill allowed_chat_ids)
 #
 # Access: if config allowed_chat_ids is non-empty, only those ids may /feed or
-# /stop. If it is empty the bot runs OPEN (anyone who finds it can feed) + warns.
+# /stop or change schedules. If it is empty the bot runs OPEN (anyone who finds it can feed) + warns.
 #
 # Anti-flood: on boot AND after any network outage the bot RESYNCS -- it discards
 # whatever piled up on Telegram's side instead of feeding once per queued /feed.
@@ -21,6 +22,7 @@ import network
 import requests
 
 from led import READY, FEEDING, ERROR
+from schedule import FeedSchedule
 
 _API = "https://api.telegram.org/bot%s/%s"
 _LONG_POLL = 20        # seconds Telegram holds a getUpdates open
@@ -36,6 +38,7 @@ class TelegramBot:
         self.allowed = set(cfg.TELEGRAM_ALLOWED_CHATIDS or [])
         self.log = log
         self.offset = 0
+        self.schedule = FeedSchedule(log=log)
 
         self.cooldown_ms = int(getattr(cfg, "FEED_COOLDOWN_S", 30)) * 1000
         self._boot = time.ticks_ms()
@@ -53,6 +56,9 @@ class TelegramBot:
         return _API % (self.token, method)
 
     def send(self, chat_id, text):
+        if chat_id is None:
+            self.log(text)
+            return
         gc.collect()
         try:
             r = requests.post(self._url("sendMessage"),
@@ -147,6 +153,7 @@ class TelegramBot:
             self.send(chat_id,
                       "Pet Feeder\n"
                       "/feed - dispense food\n"
+                      "/schedule [HH:MM ... | on | off] - daily meals (UTC-5)\n"
                       "/stop - emergency stop\n"
                       "/status - show status\n"
                       "/ping - liveness check\n"
@@ -187,13 +194,24 @@ class TelegramBot:
             self.send(chat_id, "Rebooting...")
             time.sleep(1)
             machine.reset()
+        elif cmd == "/schedule":
+            if not self._authorized(chat_id):
+                self.send(chat_id, "Not authorized (chat id %d)." % chat_id)
+                return
+            args = (msg.get("text") or "").split()[1:]
+            try:
+                if args:
+                    self.schedule.configure(args)
+                self.send(chat_id, self.schedule.describe())
+            except (ValueError, OSError) as e:
+                self.send(chat_id, "Schedule not changed: %s" % e)
         elif cmd == "/feed":
             self._do_feed(chat_id)
         elif cmd:
             self.send(chat_id, "Unknown command. Try /help.")
 
-    def _do_feed(self, chat_id):
-        if not self._authorized(chat_id):
+    def _do_feed(self, chat_id, automatic=False):
+        if not automatic and not self._authorized(chat_id):
             self.send(chat_id, "Not authorized (chat id %d)." % chat_id)
             return
         if self._feeding:
@@ -226,11 +244,21 @@ class TelegramBot:
         else:
             self.send(self._abort_chat or chat_id, "Feed stopped.")
 
+    def _check_schedule(self):
+        try:
+            self.schedule.sync_clock()
+            if self.schedule.claim_due():
+                chat_id = min(self.allowed) if self.allowed else None
+                self._do_feed(chat_id, automatic=True)
+        except Exception as e:
+            self.log("schedule error:", e)
+
     # -- main loop ------------------------------------------------------------
     def poll_forever(self):
         self.log("bot polling as", self.token.split(":")[0])
         resync_needed = True           # treat startup like a reconnect
         while True:
+            self._check_schedule()
             try:
                 if resync_needed:
                     self.resync()      # drop backlog from boot / the outage
